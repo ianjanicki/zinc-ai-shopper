@@ -1,68 +1,86 @@
-'use server';
+"use server";
 
-import { createStreamableValue } from 'ai/rsc';
-import { CoreMessage, streamText } from 'ai';
-import { openai } from '@ai-sdk/openai';
-import { Weather } from '@/components/weather';
-import { generateText } from 'ai';
-import { createStreamableUI } from 'ai/rsc';
-import { ReactNode } from 'react';
-import { z } from 'zod';
+import { generateObject, CoreMessage } from "ai";
+import { openai } from "@ai-sdk/openai";
+import { z } from "zod";
+import { Query } from "@/types/zinc";
 
 export interface Message {
-  role: 'user' | 'assistant';
+  role: "user" | "assistant";
   content: string;
-  display?: ReactNode;
+  products?: Result[];
 }
 
+const AIResponseSchema = z.object({
+  amazonQuery: z.string().optional().describe("The query to search Amazon for"),
+  message: z.string().describe("A helpful message to the user"),
+});
 
-// Streaming Chat 
-export async function continueTextConversation(messages: CoreMessage[]) {
-  const result = await streamText({
-    model: openai('gpt-4-turbo'),
-    messages,
-  });
-
-  const stream = createStreamableValue(result.textStream);
-  return stream.value;
-}
-
-// Gen UIs 
-export async function continueConversation(history: Message[]) {
-  const stream = createStreamableUI();
-
-  const { text, toolResults } = await generateText({
-    model: openai('gpt-3.5-turbo'),
-    system: 'You are a friendly weather assistant!',
-    messages: history,
-    tools: {
-      showWeather: {
-        description: 'Show the weather for a given location.',
-        parameters: z.object({
-          city: z.string().describe('The city to show the weather for.'),
-          unit: z
-            .enum(['F'])
-            .describe('The unit to display the temperature in'),
-        }),
-        execute: async ({ city, unit }) => {
-          stream.done(<Weather city={city} unit={unit} />);
-          return `Here's the weather for ${city}!`; 
-        },
+async function searchProducts(query: string): Promise<Query> {
+  const response = await fetch(
+    `https://api.zinc.io/v1/search?query=${encodeURIComponent(
+      query
+    )}&page=1&retailer=amazon`,
+    {
+      headers: {
+        Authorization: `Basic ${Buffer.from(
+          process.env.ZINC_API_KEY + ":"
+        ).toString("base64")}`,
       },
-    },
+    }
+  );
+
+  return response.json();
+}
+
+export async function continueConversation(messages: Message[]) {
+  console.log("Using Amazon-enabled chat");
+  console.log("Starting conversation with messages:", messages);
+
+  const { object } = await generateObject({
+    model: openai("gpt-3.5-turbo"),
+    schema: AIResponseSchema,
+    system:
+      "You are a fashion assistant. ONLY answer questions about fashion, clothing, style, and accessories. For any non-fashion questions, respond with: 'I can only help with fashion-related questions. Please ask me about clothing, style, accessories, or outfit recommendations!'",
+    messages: messages,
   });
+
+  console.log("AI Response:", object);
+
+  let content = object.message;
+  let products = undefined;
+
+  if (object.amazonQuery) {
+    try {
+      const searchResults = await searchProducts(object.amazonQuery);
+      if (searchResults.results.length > 0) {
+        products = searchResults.results.slice(0, 3);
+        content += "\n\nHere are some products I found:";
+      }
+    } catch (e) {
+      console.error("Failed to fetch products:", e);
+    }
+  }
 
   return {
     messages: [
-      ...history,
+      ...messages,
       {
-        role: 'assistant' as const,
-        content:
-          text || toolResults.map(toolResult => toolResult.result).join(),
-        display: stream.value,
+        role: "assistant" as const,
+        content,
+        products,
       },
     ],
   };
+}
+
+export async function continueTextConversation(messages: CoreMessage[]) {
+  return continueConversation(
+    messages.map((msg) => ({
+      role: msg.role,
+      content: String(msg.content),
+    })) as Message[]
+  );
 }
 
 // Utils
